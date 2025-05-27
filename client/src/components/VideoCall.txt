@@ -1,0 +1,229 @@
+import React, { useEffect, useRef, useState } from 'react';  //react hooks to manage state and lifecycle (useEffect for innitialization, useRef for DOM references, useState for local media stream)
+import io from 'socket.io-client'; //for real-time communication
+import { useNavigate, useParams } from 'react-router-dom'; //for dynamic room navigation 
+
+const VideoCall = () => {
+  const navigate = useNavigate();  //for navigation to different routes, allows programmatic navigation to redirect the user when leaving the call
+  const { roomId } = useParams();  //extracts the roomId from the URL
+  const socketRef = useRef();  //stores the socket.io connection
+  const localVideo = useRef(null);
+  const remoteVideo = useRef(null);
+//References to <video> DOM elements to display the local (user's own) and remote (other user's) video streams.
+ 
+  const peerConnection = useRef(null);  //stores webRTC peer connection for managing peer-to-peer connection
+//Stores the WebRTC RTCPeerConnection object, which manages the peer-to-peer connection.
+    const [stream, setStream] = useState(null);
+//Stores the local media stream, containing the user's audio and video tracks.
+    const [showMediaPrompt, setShowMediaPrompt] = useState(true);
+    const [mediaOptions, setMediaOptions] = useState({ video: false, audio: false}); //Stores the user's media options (video and audio)
+
+//useEffect for initialization
+  useEffect(() => {
+    if(showMediaPrompt) return;
+
+    socketRef.current = io('http://localhost:5000', {
+      query: { roomId },
+    });    //Initializes the Socket.IO connection, passing roomId as a query parameter to associate the client with the specified room.
+           //Stored in socketRef.current to avoid reinitializing on re-renders.
+
+    const init = async () => {
+      let localStream = null;
+
+      if(mediaOptions.video || mediaOptions.audio){
+        //Request access to the user's camera and microphone
+        localStream = await navigator.mediaDevices.getUserMedia({
+          video: mediaOptions.video,
+          audio: mediaOptions.audio 
+        });
+        //The resulting localStream is assigned to the localVideo <video> element’s srcObject to display the user’s feed.
+        localVideo.current.srcObject = localStream;
+        setStream(localStream);
+      }
+
+      socketRef.current.emit('join-room', roomId);
+      socketRef.current.on('user-joined', async (id) => {
+        peerConnection.current = createPeerConnection();
+
+        if(localStream){
+          localStream.getTracks().forEach((track) => {
+            peerConnection.current.addTrack(track, localStream);
+          });
+        }
+
+        const offer = await peerConnection.current.createOffer();
+        await peerConnection.current.setLocalDescription(offer);
+
+        socketRef.current.emit('offer', { offer, roomId });
+      });
+      console.log("Client: Initializing media stream");
+      //The stream is saved in the stream state for later use in WebRTC.
+
+      // Handle incoming offer
+      //When an offer is received from another peer:
+      //Creates a new RTCPeerConnection.
+      //Adds local stream tracks.
+      //Sets the received offer as the remote description.
+      //Creates and sets an answer (session description).
+      //Sends the answer back via Socket.IO.
+
+      socketRef.current.on('offer', async ({ offer }) => {
+        console.log("Received offer");
+        peerConnection.current = createPeerConnection();
+        
+        if(localStream){
+        localStream.getTracks().forEach((track) => {
+          peerConnection.current.addTrack(track, localStream);
+        });
+      }
+        await peerConnection.current.setRemoteDescription(new RTCSessionDescription(offer));  //the roomId isn’t included in the offer or answer events, as the Socket.IO server uses the roomId from the initial connection.
+        const answer = await peerConnection.current.createAnswer();
+        await peerConnection.current.setLocalDescription(answer);
+
+        socketRef.current.emit('answer', { answer });
+      });
+
+      // Handle incoming answer
+      //Sets the received answer as the remote description, completing the WebRTC negotiation.
+      socketRef.current.on('answer', async ({ answer }) => {
+        console.log("Received answer");
+        await peerConnection.current.setRemoteDescription(new RTCSessionDescription(answer));
+      });
+
+      // Handle ICE candidates
+      socketRef.current.on('ice-candidate', ({ candidate }) => {
+        console.log("Received ICE candidate");
+        peerConnection.current.addIceCandidate(new RTCIceCandidate(candidate));
+      }); 
+      //When the other peer sends an ICE candidate through the Socket.IO server, this code receives it.
+      //The candidate is added to the RTCPeerConnection using addIceCandidate. This allows the local peer to try connecting to the remote peer using that candidate’s address and port.
+
+      //ice(interactive connectivity establishment) candidates are potential netwrok addresses and ports that device can use to communicate with other device in a web rtc peer to peer connection
+      //each ice candidate include an ip address, port, transport protocol and type (host, srflx and relay)
+      //ice protocol helps by discoveriing connection paths(each peer generates multiple ice candidates representing different ways to reach it sinnce most devices are behind firewalls), exchanging candidate: peers exchnage these candidates by signaling server(socket.io) to find best connection path and webrtc tests the candidates to find a working pair that allows direct communication
+      
+      // If another user is already in the room, create and send offer
+      socketRef.current.on('other-user', async (otherUserId) => {
+        console.log("Other user detected, creating offer...");
+        //current user initiates rtc connection and creates and sets an offer. sends the offer to the other user via socket.io
+        peerConnection.current = createPeerConnection();
+        localStream.getTracks().forEach((track) => {
+          peerConnection.current.addTrack(track, localStream);
+        });
+
+        const offer = await peerConnection.current.createOffer();
+        await peerConnection.current.setLocalDescription(offer);
+
+        socketRef.current.emit('offer', { offer });
+      });
+
+      // Just logs when a new user joins
+      socketRef.current.on('user-joined', (id) => {
+        console.log(`User ${id} joined`);
+      });
+
+      console.log("Client connected to room:", roomId);
+    };
+
+
+    //generating ice candidate
+    const createPeerConnection = () => {
+      const pc = new RTCPeerConnection({
+        iceServers: [
+          { urls: 'stun:stun.l.google.com:19302' },
+          { urls: 'turn:your-turn-server.com', username: 'user', credential: 'pass' },
+        ],
+      }); //A STUN server (e.g., stun.l.google.com:19302) responds with the device’s public IP/port, creating a server-reflexive (srflx) ICE candidate.
+      //This allows peers to connect through NATs
+      //stun trun severs A TURN server relays media between peers, creating a relay ICE candidate.
+      //This is a fallback when STUN fails, but it’s slower and requires more server resources.
+      //when a new rtcpeerconnection is created the onicecandidate event is set up
+      pc.onicecandidate = (event) => {
+        if (event.candidate) {
+          socketRef.current.emit('ice-candidate', { candidate: event.candidate });
+        }
+      };
+
+      pc.ontrack = (event) => {
+        remoteVideo.current.srcObject = event.streams[0];
+      };
+
+      return pc;
+    };
+
+    init();
+
+    return () => {
+      if (socketRef.current) socketRef.current.disconnect();
+    };
+  }, [roomId, showMediaPrompt]);  //When the component unmounts (e.g., user navigates away), the Socket.IO connection is closed.
+  //This prevents memory leaks and ensures proper resource cleanup
+
+  const handleLeaveCall = () => {
+    if (stream) {
+      stream.getTracks().forEach((track) => track.stop());
+    }
+
+    if (peerConnection.current) {
+      peerConnection.current.close();
+    }
+
+    if (socketRef.current) {
+      socketRef.current.disconnect();
+    }
+
+    navigate('/'); //redirect back to home page
+  };
+
+  return (
+  <div className="flex flex-col items-center gap-4">
+  {showMediaPrompt && (
+    <div className="fixed inset-0 bg-black bg-opacity-70 flex flex-col items-center justify-center z-50">
+      <div className="bg-white p-6 rounded shadow text-center">
+        <h2 className="text-xl font-bold mb-4">Choose Media Options</h2>
+        <div className="flex gap-4 justify-center mb-4">
+          <label>
+            <input
+              type="checkbox"
+              checked={mediaOptions.video}
+              onChange={() =>
+                setMediaOptions((prev) => ({ ...prev, video: !prev.video }))
+              }
+            />{' '}
+            Enable Video
+          </label>
+          <label>
+            <input
+              type="checkbox"
+              checked={mediaOptions.audio}
+              onChange={() =>
+                setMediaOptions((prev) => ({ ...prev, audio: !prev.audio }))
+              }
+            />{' '}
+            Enable Microphone
+          </label>
+        </div>
+        <button
+          className="bg-blue-600 text-white px-4 py-2 rounded"
+          onClick={() => setShowMediaPrompt(false)}
+        >
+          Join Meeting
+        </button>
+      </div>
+    </div>
+  )}
+  <h2 className="text-xl font-bold">Developer Video Call (Peer to Peer)</h2>
+  <div className="flex gap-4">
+    <video ref={localVideo} autoPlay playsInline muted className="w-64 border" />
+    <video ref={remoteVideo} autoPlay playsInline className="w-64 border" />
+  </div>
+  <button
+    onClick={handleLeaveCall}
+    className="mt-4 bg-red-500 text-white px-4 py-2 rounded"
+  >
+    Leave Call
+  </button>
+</div>
+);
+};
+
+export default VideoCall;
